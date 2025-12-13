@@ -1,7 +1,10 @@
+# optimizer.py
 import os
 import json
 import random
 import itertools
+import time
+from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
 import joblib
@@ -32,7 +35,9 @@ MODEL_PATH = os.path.join(BASE_DIR, "wall_model_v2.pkl")
 #  FUNZIONI GEOMETRICHE / FEATURES
 # ============================================================
 
-def openings_valid(openings, cordoli_y, margin):
+def openings_valid(openings: List[Tuple[float, float, float, float]],
+                   cordoli_y: List[Tuple[float, float]],
+                   margin: float) -> bool:
     """
     Controlla che:
       - le aperture siano dentro la parete
@@ -81,7 +86,7 @@ def openings_valid(openings, cordoli_y, margin):
     return True
 
 
-def openings_to_features(openings):
+def openings_to_features(openings: List[Tuple[float, float, float, float]]) -> np.ndarray:
     """
     Features ML (come nel training):
       - per ogni apertura:
@@ -147,14 +152,15 @@ def openings_to_features(openings):
         ratio_bottom,               # quota di vuoti che sta sotto
     ])
 
-    return np.array(feats)
+    return np.array(feats, dtype=float)
 
 
 # ============================================================
 #  PERTURBAZIONI (SHIFT + SHRINK)
 # ============================================================
 
-def perturb_openings_x_only(openings, max_shift_m=0.15):
+def perturb_openings_x_only(openings: List[Tuple[float, float, float, float]],
+                            max_shift_m: float = 0.15) -> Optional[List[Tuple[float, float, float, float]]]:
     """Sposta solo il baricentro in x, mantenendo w,h e y1,y2."""
     dx_max = max_shift_m
     new_openings = []
@@ -186,10 +192,10 @@ def perturb_openings_x_only(openings, max_shift_m=0.15):
     return new_openings
 
 
-def perturb_openings_shift_and_shrink_subset(openings,
+def perturb_openings_shift_and_shrink_subset(openings: List[Tuple[float, float, float, float]],
                                              subset_indices,
-                                             max_shift_m=0.15,
-                                             max_shrink_ratio=0.15):
+                                             max_shift_m: float = 0.15,
+                                             max_shrink_ratio: float = 0.15) -> Optional[List[Tuple[float, float, float, float]]]:
     """
     Perturba SOLO le aperture i in subset_indices con:
       - spostamento in x del baricentro
@@ -235,49 +241,102 @@ def perturb_openings_shift_and_shrink_subset(openings,
 
 
 # ============================================================
+#  STOP CONDITIONS + COSTO "INVASIVITÀ"
+# ============================================================
+
+def openings_modification_cost(base_openings, cand_openings, alpha_shrink=1.0) -> float:
+    """
+    Costo "quanto è invasivo" il candidato rispetto al base.
+    - somma |Δxc| (spostamento baricentro in x)
+    - + alpha_shrink * somma shrink in larghezza
+    """
+    cost = 0.0
+    for (x1b, x2b, y1b, y2b), (x1c, x2c, y1c, y2c) in zip(base_openings, cand_openings):
+        w_b = x2b - x1b
+        w_c = x2c - x1c
+        xc_b = 0.5 * (x1b + x2b)
+        xc_c = 0.5 * (x1c + x2c)
+
+        cost += abs(xc_c - xc_b)
+        cost += alpha_shrink * max(0.0, w_b - w_c)
+    return float(cost)
+
+
+def should_stop(start_time: float,
+                time_limit_sec: Optional[float],
+                eval_count: int,
+                max_evals: Optional[int]) -> bool:
+    if time_limit_sec is not None and (time.time() - start_time) >= time_limit_sec:
+        return True
+    if max_evals is not None and eval_count >= max_evals:
+        return True
+    return False
+
+
+# ============================================================
 #  OTTIMIZZAZIONE (target % rispetto al progetto)
 # ============================================================
 
-def optimize_project_layout(openings_project, model,
-                            max_shift_m=0.15,
-                            max_shrink_ratio=0.15,
-                            n_shift_candidates=2000,
-                            n_level_candidates=500,
-                            improvement_target_ratio=0.15):
+def optimize_project_layout(
+    openings_project,
+    model,
+    max_shift_m=0.15,
+    max_shrink_ratio=0.15,
+    n_shift_candidates=300,
+    n_level_candidates=200,
+    improvement_target_ratio=0.15,
+    time_limit_sec=240.0,
+    max_evals=20000,
+    alpha_shrink=1.0,
+):
     """
-    Ottimizza il layout partendo da openings_project cercando di
-    migliorare V_target(15mm) del modello ML di una certa percentuale.
+    Cerca un layout che migliori la previsione ML (V a 15mm) di una %.
 
-    Ritorna:
-      best_openings, best_pred, improved (bool)
+    - tiene best assoluto trovato
+    - se trova uno o più layout che superano il target, restituisce quello
+      con costo minimo (meno invasivo) tra i feasible.
     """
+    start_time = time.time()
+    evals = 0
+
     base_feats = openings_to_features(openings_project).reshape(1, -1)
     base_pred = float(model.predict(base_feats)[0])
+    evals += 1
 
     target_pred = base_pred * (1.0 + improvement_target_ratio)
 
     best_pred = base_pred
     best_openings = openings_project
-    improved = False
+
+    best_feasible_openings = None
+    best_feasible_pred = None
+    best_feasible_cost = float("inf")
 
     # ============================
     # Fase 1: SOLO SHIFT IN X
     # ============================
-    for _ in range(n_shift_candidates):
+    for _ in range(int(n_shift_candidates)):
+        if should_stop(start_time, time_limit_sec, evals, max_evals):
+            break
+
         cand = perturb_openings_x_only(openings_project, max_shift_m=max_shift_m)
         if cand is None:
             continue
 
         feats = openings_to_features(cand).reshape(1, -1)
         pred = float(model.predict(feats)[0])
+        evals += 1
 
         if pred > best_pred:
             best_pred = pred
             best_openings = cand
-            improved = True
 
-        if best_pred >= target_pred:
-            return best_openings, best_pred, improved
+        if pred >= target_pred:
+            cost = openings_modification_cost(openings_project, cand, alpha_shrink=alpha_shrink)
+            if cost < best_feasible_cost:
+                best_feasible_cost = cost
+                best_feasible_openings = cand
+                best_feasible_pred = pred
 
     # ============================
     # Fase 2: SHIFT + SHRINK SU SOTTOINSIEMI
@@ -285,12 +344,21 @@ def optimize_project_layout(openings_project, model,
     idxs = list(range(len(openings_project)))
 
     for level in range(1, len(idxs) + 1):
+        if should_stop(start_time, time_limit_sec, evals, max_evals):
+            break
+
         subsets = list(itertools.combinations(idxs, level))
         n_subsets = len(subsets)
-        n_per_subset = max(1, n_level_candidates // n_subsets)
+        n_per_subset = max(1, int(n_level_candidates) // max(1, n_subsets))
 
         for subset in subsets:
+            if should_stop(start_time, time_limit_sec, evals, max_evals):
+                break
+
             for _ in range(n_per_subset):
+                if should_stop(start_time, time_limit_sec, evals, max_evals):
+                    break
+
                 cand = perturb_openings_shift_and_shrink_subset(
                     openings_project,
                     subset_indices=subset,
@@ -302,16 +370,23 @@ def optimize_project_layout(openings_project, model,
 
                 feats = openings_to_features(cand).reshape(1, -1)
                 pred = float(model.predict(feats)[0])
+                evals += 1
 
                 if pred > best_pred:
                     best_pred = pred
                     best_openings = cand
-                    improved = True
 
-                if best_pred >= target_pred:
-                    return best_openings, best_pred, improved
+                if pred >= target_pred:
+                    cost = openings_modification_cost(openings_project, cand, alpha_shrink=alpha_shrink)
+                    if cost < best_feasible_cost:
+                        best_feasible_cost = cost
+                        best_feasible_openings = cand
+                        best_feasible_pred = pred
 
-    return best_openings, best_pred, improved
+    if best_feasible_openings is not None:
+        return best_feasible_openings, float(best_feasible_pred), True, evals, float(target_pred), float(base_pred)
+
+    return best_openings, float(best_pred), False, evals, float(target_pred), float(base_pred)
 
 
 # ============================================================
@@ -324,30 +399,38 @@ app = Flask(__name__)
 model = joblib.load(MODEL_PATH)
 
 
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "service": "optimizer"})
+
+
 @app.route("/optimize", methods=["POST"])
 def optimize_endpoint():
     """
-    Input JSON atteso:
+    Input JSON atteso (body):
     {
       "openings": [
         {"x1": ..., "x2": ..., "y1": ..., "y2": ...},
         ...
       ],
-      "V_exist": 125.3,                # ignorato
-      "target_improvement_percent": 15 # usato
+      "target_improvement_percent": 15,
+
+      # opzionali (anche via query):
+      "n_shift_candidates": 300,
+      "n_level_candidates": 200,
+      "time_limit_sec": 240,
+      "max_evals": 20000,
+      "max_shift_m": 0.15,
+      "max_shrink_ratio": 0.15,
+      "alpha_shrink": 1.0,
+      "seed": 1
     }
 
-    Output JSON:
-    {
-      "V_achieved_kN": ...,
-      "optimized_openings": [
-        {"x1": ..., "x2": ..., "y1": ..., "y2": ...},
-        ...
-      ]
-    }
+    Nota: gli stessi parametri possono essere passati anche come query param:
+      /optimize?n_shift_candidates=300&n_level_candidates=200&time_limit_sec=240...
     """
     try:
-        data = request.get_json(force=True)
+        data = request.get_json(force=True) or {}
 
         openings_json = data.get("openings")
         if not openings_json or not isinstance(openings_json, list):
@@ -362,22 +445,57 @@ def optimize_endpoint():
         if not openings_valid(openings_project, CORDOLI_Y, MARGIN):
             return jsonify({"error": "Geometrie 'openings' non valide secondo i vincoli geometrici"}), 400
 
-        target_improvement_percent = float(data.get("target_improvement_percent", 15.0))
+        def read_int_param(name: str, default: int) -> int:
+            q = request.args.get(name, None)
+            if q is not None:
+                return int(q)
+            v = data.get(name, None)
+            return int(v) if v is not None else int(default)
+
+        def read_float_param(name: str, default: float) -> float:
+            q = request.args.get(name, None)
+            if q is not None:
+                return float(q)
+            v = data.get(name, None)
+            return float(v) if v is not None else float(default)
+
+        # -------- parametri controllabili da n8n --------
+        target_improvement_percent = read_float_param("target_improvement_percent", 15.0)
         improvement_ratio = target_improvement_percent / 100.0
 
-        # Seed per riproducibilità
-        random.seed(1)
-        np.random.seed(1)
+        n_shift_candidates = read_int_param("n_shift_candidates", 300)
+        n_level_candidates = read_int_param("n_level_candidates", 200)
 
-        best_openings, best_pred, _ = optimize_project_layout(
+        # timeout n8n: 240s -> qui imposto default 240s
+        time_limit_sec = read_float_param("time_limit_sec", 240.0)
+        max_evals = read_int_param("max_evals", 20000)
+
+        max_shift_m = read_float_param("max_shift_m", 0.15)
+        max_shrink_ratio = read_float_param("max_shrink_ratio", 0.15)
+        alpha_shrink = read_float_param("alpha_shrink", 1.0)
+
+        seed = read_int_param("seed", 1)
+
+        # Seed per riproducibilità
+        random.seed(seed)
+        np.random.seed(seed)
+
+        t0 = time.time()
+
+        best_openings, best_pred, target_reached, evals, target_pred, base_pred = optimize_project_layout(
             openings_project,
             model,
-            max_shift_m=0.15,
-            max_shrink_ratio=0.15,
-            n_shift_candidates=2000,
-            n_level_candidates=500,
+            max_shift_m=max_shift_m,
+            max_shrink_ratio=max_shrink_ratio,
+            n_shift_candidates=n_shift_candidates,
+            n_level_candidates=n_level_candidates,
             improvement_target_ratio=improvement_ratio,
+            time_limit_sec=time_limit_sec,
+            max_evals=max_evals,
+            alpha_shrink=alpha_shrink
         )
+
+        elapsed_ms = int((time.time() - t0) * 1000)
 
         optimized_openings_json = [
             {"x1": x1, "x2": x2, "y1": y1, "y2": y2}
@@ -385,7 +503,23 @@ def optimize_endpoint():
         ]
 
         response = {
-            "V_achieved_kN": best_pred,
+            "base_score_kN": float(base_pred),
+            "target_score_kN": float(target_pred),
+            "best_score_kN": float(best_pred),
+            "target_reached": bool(target_reached),
+            "evaluations": int(evals),
+            "elapsed_ms": int(elapsed_ms),
+            "params": {
+                "target_improvement_percent": float(target_improvement_percent),
+                "n_shift_candidates": int(n_shift_candidates),
+                "n_level_candidates": int(n_level_candidates),
+                "time_limit_sec": float(time_limit_sec),
+                "max_evals": int(max_evals),
+                "max_shift_m": float(max_shift_m),
+                "max_shrink_ratio": float(max_shrink_ratio),
+                "alpha_shrink": float(alpha_shrink),
+                "seed": int(seed),
+            },
             "optimized_openings": optimized_openings_json
         }
 
