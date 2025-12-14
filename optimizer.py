@@ -2,6 +2,7 @@ import os
 import json
 import random
 import itertools
+import time
 
 import numpy as np
 import joblib
@@ -27,6 +28,8 @@ WIDTH_MIN = 0.80  # usato per non stringere troppo le aperture
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "wall_model_v2.pkl")
 
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(f"Modello non trovato: {MODEL_PATH}")
 
 # ============================================================
 #  FUNZIONI GEOMETRICHE / FEATURES
@@ -156,19 +159,16 @@ def openings_to_features(openings):
 
 def perturb_openings_x_only(openings, max_shift_m=0.15):
     """Sposta solo il baricentro in x, mantenendo w,h e y1,y2."""
-    dx_max = max_shift_m
     new_openings = []
 
     for (x1, x2, y1, y2) in openings:
         w = x2 - x1
         xc = 0.5 * (x1 + x2)
 
-        xc_new = xc + random.uniform(-dx_max, dx_max)
+        xc_new = xc + random.uniform(-max_shift_m, max_shift_m)
 
         x1n = xc_new - w / 2.0
         x2n = xc_new + w / 2.0
-        y1n = y1
-        y2n = y2
 
         # rispetto margini coi bordi della parete
         shift_x = 0.0
@@ -179,7 +179,7 @@ def perturb_openings_x_only(openings, max_shift_m=0.15):
         x1n += shift_x
         x2n += shift_x
 
-        new_openings.append((x1n, x2n, y1n, y2n))
+        new_openings.append((x1n, x2n, y1, y2))
 
     if not openings_valid(new_openings, CORDOLI_Y, MARGIN):
         return None
@@ -196,7 +196,6 @@ def perturb_openings_shift_and_shrink_subset(openings,
       - riduzione larghezza (simmetrica) fino a max_shrink_ratio
       - non scende sotto WIDTH_MIN
     """
-    dx_max = max_shift_m
     new_openings = []
 
     for idx, (x1, x2, y1, y2) in enumerate(openings):
@@ -209,15 +208,13 @@ def perturb_openings_shift_and_shrink_subset(openings,
             shrink = random.uniform(0.0, max_shrink_allowed)
             w_new = w - shrink
 
-            xc_new = xc + random.uniform(-dx_max, dx_max)
+            xc_new = xc + random.uniform(-max_shift_m, max_shift_m)
         else:
             w_new = w
             xc_new = xc
 
         x1n = xc_new - w_new / 2.0
         x2n = xc_new + w_new / 2.0
-        y1n = y1
-        y2n = y2
 
         shift_x = 0.0
         if x1n < MARGIN:
@@ -227,7 +224,7 @@ def perturb_openings_shift_and_shrink_subset(openings,
         x1n += shift_x
         x2n += shift_x
 
-        new_openings.append((x1n, x2n, y1n, y2n))
+        new_openings.append((x1n, x2n, y1, y2))
 
     if not openings_valid(new_openings, CORDOLI_Y, MARGIN):
         return None
@@ -244,13 +241,6 @@ def optimize_project_layout(openings_project, model,
                             n_shift_candidates=2000,
                             n_level_candidates=500,
                             improvement_target_ratio=0.15):
-    """
-    Ottimizza il layout partendo da openings_project cercando di
-    migliorare V_target(15mm) del modello ML di una certa percentuale.
-
-    Ritorna:
-      best_openings, best_pred, improved (bool)
-    """
     base_feats = openings_to_features(openings_project).reshape(1, -1)
     base_pred = float(model.predict(base_feats)[0])
 
@@ -332,26 +322,22 @@ def optimize_endpoint():
       {
         "body": {
           "openings": [...],
-          "V_exist": ...,
           "target_improvement_percent": ...,
           "n_shift_candidates": ...,
-          "n_level_candidates": ...
-        }
-      }
-    ]
+          "n_level_candidates": ...,
 
-    Output JSON:
-    [
-      {
-        "V_achieved_kN": ...,
-        "optimized_openings": [...]
+          # opzionali:
+          "seed": 1,
+          "max_shift_m": 0.15,
+          "max_shrink_ratio": 0.15
+        }
       }
     ]
     """
     try:
         payload = request.get_json(force=True)
 
-        # --- Adattamento minimo al wrapper n8n: [{ "body": {...} }]
+        # wrapper n8n: [{ "body": {...} }]
         if isinstance(payload, list) and len(payload) > 0 and isinstance(payload[0], dict):
             data = payload[0].get("body", payload[0])
         elif isinstance(payload, dict):
@@ -363,11 +349,10 @@ def optimize_endpoint():
         if not openings_json or not isinstance(openings_json, list):
             return jsonify([{"error": "Campo 'openings' mancante o non valido"}]), 400
 
-        openings_project = []
-        for o in openings_json:
-            openings_project.append(
-                (float(o["x1"]), float(o["x2"]), float(o["y1"]), float(o["y2"]))
-            )
+        openings_project = [
+            (float(o["x1"]), float(o["x2"]), float(o["y1"]), float(o["y2"]))
+            for o in openings_json
+        ]
 
         if not openings_valid(openings_project, CORDOLI_Y, MARGIN):
             return jsonify([{"error": "Geometrie 'openings' non valide secondo i vincoli geometrici"}]), 400
@@ -375,21 +360,25 @@ def optimize_endpoint():
         target_improvement_percent = float(data.get("target_improvement_percent", 15.0))
         improvement_ratio = target_improvement_percent / 100.0
 
-        # --- Nuovi parametri candidati (con fallback e gestione chiave con spazio)
         n_shift_candidates = int(data.get("n_shift_candidates", 2000))
-        # gestisco sia "n_level_candidates" che "n_level_candidates " (con spazio finale)
         n_level_candidates = data.get("n_level_candidates", data.get("n_level_candidates ", 500))
         n_level_candidates = int(n_level_candidates)
 
-        # Seed per riproducibilità
-        random.seed(1)
-        np.random.seed(1)
+        # (opzionale) controlli sulla “forza” delle perturbazioni
+        max_shift_m = float(data.get("max_shift_m", 0.15))
+        max_shrink_ratio = float(data.get("max_shrink_ratio", 0.15))
+
+        # Seed: se non lo passi resta riproducibile (1).
+        # Se vuoi variabilità: passa seed diverso ad ogni chiamata.
+        seed = int(data.get("seed", 1))
+        random.seed(seed)
+        np.random.seed(seed)
 
         best_openings, best_pred, _ = optimize_project_layout(
             openings_project,
             model,
-            max_shift_m=0.15,
-            max_shrink_ratio=0.15,
+            max_shift_m=max_shift_m,
+            max_shrink_ratio=max_shrink_ratio,
             n_shift_candidates=n_shift_candidates,
             n_level_candidates=n_level_candidates,
             improvement_target_ratio=improvement_ratio,
@@ -401,11 +390,19 @@ def optimize_endpoint():
         ]
 
         response_obj = {
-            "V_achieved_kN": best_pred,
-            "optimized_openings": optimized_openings_json
+            "V_achieved_kN": float(best_pred),
+            "optimized_openings": optimized_openings_json,
+            "meta": {
+                "model_path": MODEL_PATH,
+                "seed": seed,
+                "max_shift_m": max_shift_m,
+                "max_shrink_ratio": max_shrink_ratio,
+                "n_shift_candidates": n_shift_candidates,
+                "n_level_candidates": n_level_candidates,
+                "target_improvement_percent": target_improvement_percent,
+            }
         }
 
-        # --- Output come lista di 1 elemento, come richiesto
         return jsonify([response_obj])
 
     except Exception as e:
